@@ -1,6 +1,8 @@
-from axis.planner import Planner
+from axis.backends.base import BackendResult
+from axis.planner import Planner, _extract_json_object
 from axis.scheduler import Scheduler
 from axis.types import Strategy, Task
+from axis.world_model import ActionSchema, WorldModel
 
 
 def _prep(task: Task, **planner_kwargs):
@@ -134,3 +136,188 @@ def test_per_step_max_tokens_positive():
     plan = p.plan(t, b, g)
     for s in plan.steps:
         assert s.max_tokens >= 256
+
+
+# ---------------------------------------------------------------------------
+# LLM-driven decomposition (§1.2)
+# ---------------------------------------------------------------------------
+class _ScriptedBackend:
+    def __init__(self, *outputs: str):
+        self.outputs = list(outputs)
+        self.calls: list[dict] = []
+
+    def run(self, prompt, max_tokens, tool=None, tool_inventory=None):
+        self.calls.append({"prompt": prompt, "max_tokens": max_tokens})
+        text = self.outputs.pop(0) if self.outputs else ""
+        return BackendResult(
+            output=text,
+            tokens_used=max(1, len(text) // 4),
+            success=True,
+            entropy=0.0,
+        )
+
+
+_GOOD_JSON_PLAN = """{
+  "steps": [
+    {"id": "a", "action": "retrieve_context", "tool": "retrieval",
+     "strategy": "retrieval_first", "depends_on": []},
+    {"id": "b", "action": "reason_about_task", "tool": null,
+     "strategy": "analytical", "depends_on": ["a"]},
+    {"id": "c", "action": "produce_final_answer", "tool": null,
+     "strategy": "analytical", "depends_on": ["b"]}
+  ]
+}"""
+
+
+def test_llm_decomposition_parses_json_plan():
+    backend = _ScriptedBackend(_GOOD_JSON_PLAN)
+    t = Task(input="Explain the CAP theorem", task_class="analysis")
+    p, b, g = _prep(t, backend=backend)
+    plan = p.plan(t, b, g)
+    assert plan.rationale.startswith("llm_decomposition:")
+    assert len(plan.steps) == 3
+    actions = [s.action for s in plan.steps]
+    assert actions == [
+        "retrieve_context",
+        "reason_about_task",
+        "produce_final_answer",
+    ]
+    # DAG dependencies are resolved to real step ids.
+    assert plan.steps[1].depends_on == [plan.steps[0].step_id]
+    assert plan.steps[2].depends_on == [plan.steps[1].step_id]
+
+
+def test_llm_decomposition_handles_code_fenced_response():
+    fenced = "```json\n" + _GOOD_JSON_PLAN + "\n```"
+    backend = _ScriptedBackend(fenced)
+    t = Task(input="x", task_class="analysis")
+    p, b, g = _prep(t, backend=backend)
+    plan = p.plan(t, b, g)
+    assert len(plan.steps) == 3
+
+
+def test_llm_decomposition_falls_back_on_malformed_json():
+    backend = _ScriptedBackend(
+        "not json at all",
+        "still not json",
+        "definitely not json",
+    )
+    t = Task(input="x", task_class="analysis")
+    p, b, g = _prep(t, backend=backend, llm_candidates_k=3)
+    plan = p.plan(t, b, g)
+    # Should silently fall back to rule-based decomposition.
+    assert plan.rationale.startswith("default_decomposition:")
+    # All three candidate attempts were made before giving up.
+    assert len(backend.calls) == 3
+
+
+def test_llm_decomposition_falls_back_on_cycle():
+    cyclic = """{
+      "steps": [
+        {"id": "a", "action": "x", "strategy": "analytical",
+         "depends_on": ["b"]},
+        {"id": "b", "action": "y", "strategy": "analytical",
+         "depends_on": ["a"]}
+      ]
+    }"""
+    backend = _ScriptedBackend(cyclic)
+    t = Task(input="x", task_class="analysis")
+    p, b, g = _prep(t, backend=backend, llm_candidates_k=1)
+    plan = p.plan(t, b, g)
+    assert plan.rationale.startswith("default_decomposition:")
+
+
+def test_llm_decomposition_respects_world_model_feasibility():
+    infeasible = """{
+      "steps": [
+        {"id": "a", "action": "run_tool", "strategy": "tool_first",
+         "depends_on": []}
+      ]
+    }"""
+    feasible = """{
+      "steps": [
+        {"id": "a", "action": "prepare", "strategy": "analytical",
+         "depends_on": []},
+        {"id": "b", "action": "run_tool", "strategy": "tool_first",
+         "depends_on": ["a"]}
+      ]
+    }"""
+    wm = WorldModel(
+        schemas=[
+            ActionSchema(
+                action="prepare",
+                preconditions=[],
+                postconditions_on_success=["ready"],
+                estimated_latency_ms=10,
+            ),
+            ActionSchema(
+                action="run_tool",
+                preconditions=["ready"],
+                postconditions_on_success=["done"],
+                estimated_latency_ms=20,
+            ),
+        ]
+    )
+    backend = _ScriptedBackend(infeasible, feasible)
+    t = Task(input="do the thing", task_class="analysis")
+    p, b, g = _prep(t, backend=backend, world_model=wm, llm_candidates_k=2)
+    plan = p.plan(t, b, g)
+    assert plan.rationale.startswith("llm_decomposition:")
+    assert [s.action for s in plan.steps] == ["prepare", "run_tool"]
+
+
+def test_llm_decomposition_falls_back_when_no_feasible_candidate():
+    # Only infeasible candidate — no prerequisite satisfied.
+    infeasible = """{
+      "steps": [
+        {"id": "a", "action": "run_tool", "strategy": "tool_first",
+         "depends_on": []}
+      ]
+    }"""
+    wm = WorldModel(
+        schemas=[
+            ActionSchema(
+                action="run_tool",
+                preconditions=["ready"],
+                postconditions_on_success=["done"],
+            )
+        ]
+    )
+    backend = _ScriptedBackend(infeasible, infeasible)
+    t = Task(input="x", task_class="analysis")
+    p, b, g = _prep(t, backend=backend, world_model=wm, llm_candidates_k=2)
+    plan = p.plan(t, b, g)
+    assert plan.rationale.startswith("default_decomposition:")
+
+
+def test_llm_decomposition_skipped_when_procedural_template_matches():
+    template = {
+        "name": "fixed_template",
+        "steps": [
+            {"action": "step1", "strategy": "analytical"},
+            {"action": "step2", "strategy": "analytical"},
+        ],
+    }
+    backend = _ScriptedBackend(_GOOD_JSON_PLAN)
+    t = Task(input="x", task_class="code_debug")
+    p, b, g = _prep(
+        t, backend=backend, procedural_memory={"code_debug": template}
+    )
+    plan = p.plan(t, b, g)
+    assert plan.rationale.startswith("procedural_template:")
+    # Backend was never consulted when a procedural template exists.
+    assert backend.calls == []
+
+
+def test_extract_json_object_handles_strings_with_braces():
+    raw = 'prose {"steps": [{"action": "a { fake", "strategy": "analytical"}]} tail'
+    extracted = _extract_json_object(raw)
+    assert extracted is not None
+    import json as _json
+
+    parsed = _json.loads(extracted)
+    assert parsed["steps"][0]["action"] == "a { fake"
+
+
+def test_extract_json_object_returns_none_on_missing_brace():
+    assert _extract_json_object("no json here") is None
