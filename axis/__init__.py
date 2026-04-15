@@ -41,10 +41,22 @@ from .adaptation import (
     Proposal,
 )
 from .eval_harness import EvalCase, EvalHarness, EvalReport
+from .multi_instance import FederatedCoordinator, InstanceReport, LocalOverride
+from .objectives import ConflictResolution, ObjectiveStack
 from .policy_router import PolicyRouter, RoutingDecision
+from .reference_frame import (
+    ArchitectureAwareness,
+    ComputationPosition,
+    GradientSignals,
+    InteractionModel,
+    KnowledgeTopology,
+    ReferenceFrame,
+    ResourceHorizon,
+)
 from .safety import InvariantViolation, SafetyMonitor
 from .telemetry import StructuredSink, TelemetryObserver, TelemetryRecord
 from .verifier import VerificationResult, Verifier, VerifierConfig
+from .world_model import ActionSchema, Transition, TypedState, WorldModel
 from .runtime import AxisRuntime
 
 __all__ = [
