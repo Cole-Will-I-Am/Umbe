@@ -1,5 +1,8 @@
 from axis.backends.stub import StubBackend
 from axis.executor import Executor
+from axis.memory import Episode, EpisodicMemory, MemoryManager
+from axis.memory.embedding import embed
+from axis.planner import Planner
 from axis.runtime import AxisRuntime
 from axis.telemetry import StructuredSink, TelemetryObserver
 from axis.types import Stakes, Task, TaskOutcome
@@ -92,6 +95,77 @@ def test_runtime_self_model_refresh_hook_runs():
     # The bootstrap fields not replaced by the snapshot should still be there
     assert "architecture" in after
     assert after is not before
+
+
+def test_runtime_auto_wires_memory_retriever_into_planner():
+    """When a MemoryManager is configured, the Runtime should install a
+    retriever on the Planner so retrieve_context steps get real
+    episodic + semantic hits injected."""
+    memory = MemoryManager()
+    # Seed an episode that should show up on a similar query.
+    memory.episodic.add(
+        Episode(
+            episode_id="e1",
+            timestamp=0.0,
+            task_hash="h",
+            task_class="research",
+            input_summary="Previous research: transformer attention scaling laws",
+            strategy_used="analytical",
+            tools_invoked=[],
+            outcome="success",
+            embedding=embed("transformer attention scaling laws"),
+        )
+    )
+    memory.semantic.upsert(
+        type="fact",
+        content="Attention is all you need (Vaswani et al. 2017)",
+        confidence=0.9,
+    )
+
+    planner = Planner(
+        self_model={
+            "capabilities": {"research": {"best_strategy": "retrieval_first"}}
+        }
+    )
+    assert planner.retriever is None
+
+    rt = AxisRuntime(
+        executor=Executor(backend=StubBackend()),
+        planner=planner,
+        memory=memory,
+    )
+    # Retriever installed.
+    assert rt.planner.retriever is not None
+
+    t = Task(
+        input="Explain transformer attention scaling laws",
+        task_class="research",
+    )
+    trace = rt.run(t)
+    assert trace.outcome == TaskOutcome.SUCCESS
+
+    # The stub backend echoes the prompt prefix back; we can search the
+    # captured step outputs for evidence the retrieved context reached
+    # the executor.
+    all_output = "".join(sr.output for sr in trace.step_results)
+    assert "retrieved_context" in all_output
+
+
+def test_runtime_does_not_override_existing_retriever():
+    sentinel = lambda inp, cls: "sentinel-output"
+    planner = Planner(retriever=sentinel)
+    rt = AxisRuntime(
+        executor=Executor(backend=StubBackend()),
+        planner=planner,
+        memory=MemoryManager(),
+    )
+    assert rt.planner.retriever is sentinel
+
+
+def test_runtime_without_memory_leaves_retriever_unset():
+    planner = Planner()
+    rt = AxisRuntime(executor=Executor(backend=StubBackend()), planner=planner)
+    assert rt.planner.retriever is None
 
 
 def test_runtime_captures_failure_in_telemetry():

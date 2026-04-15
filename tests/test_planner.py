@@ -321,3 +321,55 @@ def test_extract_json_object_handles_strings_with_braces():
 
 def test_extract_json_object_returns_none_on_missing_brace():
     assert _extract_json_object("no json here") is None
+
+
+# ---------------------------------------------------------------------------
+# Retriever injection
+# ---------------------------------------------------------------------------
+def test_retriever_output_is_injected_into_retrieve_context_step():
+    calls: list = []
+
+    def _fake_retriever(task_input, task_class):
+        calls.append((task_input, task_class))
+        return "- fact: the sky is blue\n- fact: water is wet"
+
+    self_model = {
+        "capabilities": {"research": {"best_strategy": "retrieval_first"}},
+    }
+    t = Task(input="What colour is the sky?", task_class="research")
+    p, b, g = _prep(t, self_model=self_model, retriever=_fake_retriever)
+    plan = p.plan(t, b, g)
+
+    retrieve_step = next(s for s in plan.steps if s.action == "retrieve_context")
+    assert "[retrieved_context]" in retrieve_step.prompt
+    assert "the sky is blue" in retrieve_step.prompt
+    assert calls == [("What colour is the sky?", "research")]
+
+
+def test_retriever_exception_does_not_break_planning():
+    def _boom(_i, _c):
+        raise RuntimeError("retriever exploded")
+
+    self_model = {
+        "capabilities": {"research": {"best_strategy": "retrieval_first"}},
+    }
+    t = Task(input="x", task_class="research")
+    p, b, g = _prep(t, self_model=self_model, retriever=_boom)
+    plan = p.plan(t, b, g)
+    retrieve_step = next(s for s in plan.steps if s.action == "retrieve_context")
+    # No retrieved_context block means we fell back to the plain prompt.
+    assert "[retrieved_context]" not in retrieve_step.prompt
+
+
+def test_retriever_empty_result_leaves_prompt_unwrapped():
+    def _empty(task_input, task_class):
+        return ""
+
+    self_model = {
+        "capabilities": {"research": {"best_strategy": "retrieval_first"}},
+    }
+    t = Task(input="x", task_class="research")
+    p, b, g = _prep(t, self_model=self_model, retriever=_empty)
+    plan = p.plan(t, b, g)
+    retrieve_step = next(s for s in plan.steps if s.action == "retrieve_context")
+    assert "[retrieved_context]" not in retrieve_step.prompt

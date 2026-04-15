@@ -52,6 +52,15 @@ class AxisRuntime:
         self.max_replans = max_replans
         self.auto_refresh_self_model = auto_refresh_self_model
 
+        # Auto-wire a retriever from MemoryManager into the Planner if:
+        #   * a MemoryManager is configured, AND
+        #   * the Planner doesn't already have a retriever set.
+        # The retriever is read-only — it calls ``similar()`` on the
+        # episodic + semantic stores, which is explicitly allowed by
+        # the §6 State Access Matrix.
+        if self.memory is not None and getattr(self.planner, "retriever", None) is None:
+            self.planner.retriever = self._build_memory_retriever()
+
     def run(
         self,
         task: Task,
@@ -178,6 +187,50 @@ class AxisRuntime:
             self.planner.procedural_memory = self.memory.procedural_index_for_planner()
 
         return trace
+
+    def _build_memory_retriever(self, top_k: int = 5):
+        """Return a closure that reads from the configured MemoryManager.
+
+        Pulls the top-k nearest episodic hits + top-k semantic entities
+        for a query and formats them as a short bullet list. Read-only
+        — never mutates either store.
+        """
+        memory = self.memory
+        assert memory is not None
+
+        def _retrieve(task_input: str, task_class: str) -> str:
+            lines: list[str] = []
+            try:
+                ep_hits = memory.episodic.similar(task_input, top_k=top_k)
+            except Exception:
+                ep_hits = []
+            for ep, score in ep_hits:
+                if score <= 0:
+                    continue
+                snippet = (ep.input_summary or "").strip().replace("\n", " ")
+                if not snippet:
+                    continue
+                lines.append(
+                    f"- episodic[{ep.task_class}, outcome={ep.outcome}, "
+                    f"sim={score:.2f}]: {snippet[:160]}"
+                )
+            try:
+                sem_hits = memory.semantic.similar(task_input, top_k=top_k)
+            except Exception:
+                sem_hits = []
+            for ent, score in sem_hits:
+                if score <= 0:
+                    continue
+                snippet = (ent.content or "").strip().replace("\n", " ")
+                if not snippet:
+                    continue
+                lines.append(
+                    f"- semantic[{ent.type}, conf={ent.confidence:.2f}, "
+                    f"sim={score:.2f}]: {snippet[:160]}"
+                )
+            return "\n".join(lines)
+
+        return _retrieve
 
     def _refresh_self_model(self) -> None:
         """Pull a fresh Self-Model snapshot from the Observer into the Planner.

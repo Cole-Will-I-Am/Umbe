@@ -16,12 +16,17 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 from .backends.base import InferenceBackend
 from .config import DEFAULT_SELF_MODEL
 from .types import Budget, Gates, Plan, PlanStep, Strategy, Task
 from .world_model import TypedState, WorldModel
+
+# Retriever contract: (task_input, task_class) -> retrieved-context string.
+# Return an empty string when there is nothing useful to add — the
+# Planner inlines whatever it gets.
+Retriever = Callable[[str, str], str]
 
 
 class Planner:
@@ -35,6 +40,7 @@ class Planner:
         world_model: Optional[WorldModel] = None,
         llm_candidates_k: int = 3,
         llm_max_tokens: int = 1024,
+        retriever: Optional[Retriever] = None,
     ):
         # Deep-copy-lite: shallow copies are fine here since Priority 1
         # treats both as read-only.
@@ -48,6 +54,11 @@ class Planner:
         self.world_model = world_model
         self.llm_candidates_k = llm_candidates_k
         self.llm_max_tokens = llm_max_tokens
+        # Optional retriever: given task_input + task_class, returns a
+        # short string of retrieved context. The Planner injects the
+        # result into the prompt of any ``retrieve_context`` step it
+        # emits. Default None → no-op, behaviour unchanged.
+        self.retriever = retriever
 
     # ------------------------------------------------------------------
     # Public API
@@ -289,7 +300,18 @@ class Planner:
         return steps
 
     def _prompt_for(self, action: str, task: Task) -> str:
-        return f"[{action}] Task: {task.input}"
+        base = f"[{action}] Task: {task.input}"
+        if action == "retrieve_context" and self.retriever is not None:
+            try:
+                retrieved = self.retriever(task.input, task.task_class) or ""
+            except Exception:
+                retrieved = ""
+            if retrieved:
+                base = (
+                    f"[{action}] Task: {task.input}\n"
+                    f"[retrieved_context]\n{retrieved}\n[/retrieved_context]"
+                )
+        return base
 
     # ------------------------------------------------------------------
     # LLM-driven decomposition (§1.2)
