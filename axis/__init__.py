@@ -23,6 +23,7 @@ from .types import (
 from .scheduler import Scheduler, SchedulerConfig
 from .planner import Planner
 from .executor import Executor, WorkingMemory
+from .telemetry import StructuredSink, TelemetryObserver, TelemetryRecord
 from .runtime import AxisRuntime
 
 __all__ = [
@@ -41,5 +42,8 @@ __all__ = [
     "Planner",
     "Executor",
     "WorkingMemory",
+    "TelemetryObserver",
+    "TelemetryRecord",
+    "StructuredSink",
     "AxisRuntime",
 ]

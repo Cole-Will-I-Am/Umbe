@@ -157,17 +157,53 @@ class StepResult:
 
 @dataclass
 class ExecutionTrace:
-    """End-to-end record of running a Plan. Consumed (later) by Telemetry Observer."""
+    """End-to-end record of running a Plan. Consumed by the Telemetry Observer.
+
+    Fields populated by Priority-1 components:
+        step_results, total_tokens, replanning_events, outcome, error,
+        timing, strategy (copied from the final Plan).
+
+    Fields reserved for later priorities (remain at their defaults until
+    those components ship):
+        verifier_score        — Priority 4 Verifier
+        confidence_predicted  — Priority 4 Verifier
+        routing_decision      — Priority 5 Policy Router
+        user_correction       — Priority 3 post-task feedback channel
+    """
 
     task_id: str
+    task_class: str = "general"
+    strategy: Optional[Strategy] = None
     step_results: list[StepResult] = field(default_factory=list)
+    planning_tokens: int = 0
+    execution_tokens: int = 0
+    verification_tokens: int = 0
     total_tokens: int = 0
     replanning_events: int = 0
     start_time: float = field(default_factory=time.time)
     end_time: Optional[float] = None
     outcome: TaskOutcome = TaskOutcome.SUCCESS
     error: Optional[str] = None
+    verifier_score: Optional[float] = None
+    confidence_predicted: Optional[float] = None
+    routing_decision: Optional[dict] = None
+    user_correction: Optional[bool] = None
 
     def latency_ms(self) -> int:
         end = self.end_time if self.end_time is not None else time.time()
         return int((end - self.start_time) * 1000)
+
+    def tool_call_summary(self) -> list[dict]:
+        """Flatten tool calls across all steps for telemetry emission."""
+        out: list[dict] = []
+        for sr in self.step_results:
+            for tc in sr.tool_calls:
+                out.append(
+                    {
+                        "tool": tc.get("tool"),
+                        "success": tc.get("success", True),
+                        "error": tc.get("error"),
+                        "latency_ms": tc.get("latency_ms", 0),
+                    }
+                )
+        return out

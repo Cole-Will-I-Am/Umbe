@@ -110,7 +110,10 @@ class Executor:
         tool_inventory: Optional[dict] = None,
     ) -> ExecutionTrace:
         wm = working_memory or WorkingMemory()
-        trace = ExecutionTrace(task_id=plan.task_id)
+        trace = ExecutionTrace(
+            task_id=plan.task_id,
+            strategy=plan.strategy,
+        )
 
         try:
             order = plan.topological_order()
@@ -124,13 +127,14 @@ class Executor:
             # Respect the Scheduler's execution sub-budget. We don't look at
             # total_tokens here because the Planner may have allocated the
             # verification/buffer slices for other components.
-            if trace.total_tokens >= plan.budget.execution_tokens:
+            if trace.execution_tokens >= plan.budget.execution_tokens:
                 trace.outcome = TaskOutcome.PARTIAL
                 trace.error = "execution_budget_exhausted"
                 break
 
             result = self.execute_step(step, wm, tool_inventory)
             trace.step_results.append(result)
+            trace.execution_tokens += result.tokens_used
             trace.total_tokens += result.tokens_used
 
             if not result.success:
