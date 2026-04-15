@@ -20,9 +20,11 @@ from typing import Optional
 from .executor import Executor, WorkingMemory
 from .memory import MemoryManager
 from .planner import Planner
+from .policy_router import PolicyRouter, RoutingDecision
 from .scheduler import Scheduler
 from .telemetry import TelemetryObserver
 from .types import ExecutionTrace, Task, TaskOutcome
+from .verifier import VerificationResult, Verifier
 
 
 class AxisRuntime:
@@ -35,6 +37,8 @@ class AxisRuntime:
         executor: Optional[Executor] = None,
         observer: Optional[TelemetryObserver] = None,
         memory: Optional[MemoryManager] = None,
+        verifier: Optional[Verifier] = None,
+        policy_router: Optional[PolicyRouter] = None,
         max_replans: int = 2,
         auto_refresh_self_model: bool = True,
     ) -> None:
@@ -43,6 +47,8 @@ class AxisRuntime:
         self.executor = executor or Executor()
         self.observer = observer
         self.memory = memory
+        self.verifier = verifier
+        self.policy_router = policy_router
         self.max_replans = max_replans
         self.auto_refresh_self_model = auto_refresh_self_model
 
@@ -59,12 +65,33 @@ class AxisRuntime:
         handed to the TelemetryObserver (if configured); the Observer
         is the only component permitted to write the Self-Model (§6).
         """
-        # Scheduler first: it owns budget and gating.
+        # Policy Router (optional) decides strategy / verification depth /
+        # retrieval posture before the Scheduler allocates budget.
+        routing_decision: Optional[RoutingDecision] = None
+        if self.policy_router is not None:
+            routing_decision = self.policy_router.route(
+                task, self_model=self.planner.self_model
+            )
+
+        # Scheduler next: it owns budget and gating.
         budget = self.scheduler.allocate(task, self.planner.self_model)
         gates = self.scheduler.gates(task, self.planner.self_model)
+        # Router can force the verification gate open/closed — but never
+        # below the safety floor (Verifier.verify still enforces §5
+        # Honesty on CRITICAL stakes).
+        if routing_decision is not None:
+            if routing_decision.verification_depth == "skip":
+                gates.verification = False
+            elif routing_decision.verification_depth == "full":
+                gates.verification = True
 
         # Planner turns the task into an executable DAG.
         plan = self.planner.plan(task, budget, gates)
+        # If the Policy Router chose a strategy, override the Planner's
+        # fallback choice on the plan object so downstream telemetry
+        # reflects the routing decision.
+        if routing_decision is not None:
+            plan.strategy = routing_decision.strategy
 
         # Executor carries it out in its own fresh Working Memory.
         wm = WorkingMemory()
@@ -96,6 +123,45 @@ class AxisRuntime:
         trace.task_class = task.task_class
         if trace.strategy is None:
             trace.strategy = plan.strategy
+        if routing_decision is not None:
+            trace.routing_decision = routing_decision.to_dict()
+
+        # Verifier: scores the execution, never mutates it. Control
+        # returns to the Planner on failing score (replan once more).
+        if self.verifier is not None:
+            result = self.verifier.verify(task, trace, gate_open=gates.verification)
+            trace.verifier_score = result.score
+            trace.confidence_predicted = result.confidence
+            trace.verification_tokens = 0  # stub backend, no token charge
+            if not result.passed and not result.skipped:
+                # Single verifier-driven replan attempt — bounded so we
+                # don't loop forever on a pathologically failing task.
+                if trace.replanning_events < self.max_replans and trace.step_results:
+                    failed = trace.step_results[-1]
+                    plan = self.planner.replan(
+                        task=task,
+                        plan=plan,
+                        failed_step_id=failed.step_id,
+                        error=f"verifier_rejected:{result.rationale}",
+                    )
+                    trace.replanning_events += 1
+                    wm = WorkingMemory()
+                    new_trace = self.executor.execute_plan(plan, wm, tool_inventory)
+                    new_trace.task_class = task.task_class
+                    new_trace.strategy = plan.strategy
+                    new_trace.replanning_events = trace.replanning_events
+                    if routing_decision is not None:
+                        new_trace.routing_decision = routing_decision.to_dict()
+                    # Re-verify the new attempt
+                    result2 = self.verifier.verify(
+                        task, new_trace, gate_open=gates.verification
+                    )
+                    new_trace.verifier_score = result2.score
+                    new_trace.confidence_predicted = result2.confidence
+                    trace = new_trace
+
+        if self.policy_router is not None and routing_decision is not None:
+            self.policy_router.record_outcome(task.task_id, trace.outcome.value)
 
         if self.observer is not None:
             self.observer.record_trace(trace, task, plan)

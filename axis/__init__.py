@@ -33,7 +33,9 @@ from .memory import (
     SemanticEntity,
     SemanticMemory,
 )
+from .policy_router import PolicyRouter, RoutingDecision
 from .telemetry import StructuredSink, TelemetryObserver, TelemetryRecord
+from .verifier import VerificationResult, Verifier, VerifierConfig
 from .runtime import AxisRuntime
 
 __all__ = [
@@ -63,5 +65,10 @@ __all__ = [
     "ProceduralMemory",
     "Procedure",
     "ForgettingEngine",
+    "Verifier",
+    "VerifierConfig",
+    "VerificationResult",
+    "PolicyRouter",
+    "RoutingDecision",
     "AxisRuntime",
 ]

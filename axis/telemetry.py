@@ -412,14 +412,72 @@ class TelemetryObserver:
         """
         metrics = self.metrics()
 
+        # Per-class breakdown needs strategy + outcome + calibration joined.
+        # We scan the whole record buffer once and fold.
+        per_class_strategy_stats: dict[str, dict[str, dict[str, int]]] = {}
+        per_class_calibration: dict[str, list[tuple[float, float]]] = {}
+        per_class_failure_modes: dict[str, Counter] = {}
+        for rec in self._records_all:
+            cls = rec.task_class
+            if rec.strategy:
+                s = per_class_strategy_stats.setdefault(cls, {}).setdefault(
+                    rec.strategy, {"total": 0, "wins": 0}
+                )
+                s["total"] += 1
+                if rec.outcome == TaskOutcome.SUCCESS.value:
+                    s["wins"] += 1
+            if rec.confidence_predicted is not None:
+                per_class_calibration.setdefault(cls, []).append(
+                    (
+                        rec.confidence_predicted,
+                        1.0 if rec.outcome == TaskOutcome.SUCCESS.value else 0.0,
+                    )
+                )
+            if rec.outcome == TaskOutcome.FAILURE.value:
+                per_class_failure_modes.setdefault(cls, Counter())[
+                    rec.error or "unknown"
+                ] += 1
+
         capabilities: dict[str, dict[str, Any]] = {}
         for cls, win_rate in metrics["win_rate_by_class"].items():
+            # Pick best_strategy as the one with the highest win rate for
+            # this class, with a minimum sample size to avoid noise.
+            best_strategy: Optional[str] = None
+            best_rate = -1.0
+            for strat, stats in per_class_strategy_stats.get(cls, {}).items():
+                if stats["total"] < 3:
+                    continue
+                rate = stats["wins"] / stats["total"]
+                if rate > best_rate:
+                    best_rate = rate
+                    best_strategy = strat
+
+            # Per-class calibration error
+            calib_pairs = per_class_calibration.get(cls, [])
+            calibration_error: Optional[float] = None
+            if calib_pairs:
+                calibration_error = sum(abs(p - a) for p, a in calib_pairs) / len(
+                    calib_pairs
+                )
+
+            known_modes = [
+                m
+                for m, _ in per_class_failure_modes.get(cls, Counter()).most_common(3)
+            ]
+
             capabilities[cls] = {
                 "win_rate": round(win_rate, 4),
                 "avg_cost_tokens": round(
                     metrics["avg_cost_by_class"].get(cls, 0.0), 1
                 ),
                 "sample_size": len(self._outcomes_by_class[cls]),
+                "best_strategy": best_strategy,
+                "confidence_calibration_error": (
+                    round(calibration_error, 4)
+                    if calibration_error is not None
+                    else None
+                ),
+                "known_failure_modes": known_modes,
             }
 
         # Strategy effectiveness = selection_rate × per-strategy win rate
