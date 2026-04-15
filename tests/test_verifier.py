@@ -14,7 +14,14 @@ from axis.types import (
     Task,
     TaskOutcome,
 )
-from axis.verifier import Verifier, VerifierConfig, _combine_signals
+from axis.verifier import (
+    LLMCoherenceClassifier,
+    MarkerCoherenceClassifier,
+    Verifier,
+    VerifierConfig,
+    _combine_signals,
+    _parse_coherence_response,
+)
 
 
 def _trace_with_output(
@@ -157,3 +164,110 @@ def test_verifier_contradiction_marker_hurts_score():
     r_muddled = v.verify(Task(input="x"), muddled, gate_open=True)
     assert r_muddled.coherence_severity > r_clean.coherence_severity
     assert r_muddled.score < r_clean.score
+
+
+# ---------------------------------------------------------------------------
+# Pluggable coherence classifier (§1.3)
+# ---------------------------------------------------------------------------
+class _ScriptedBackend:
+    """Minimal backend test double returning a fixed text on every call."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.prompts: list[str] = []
+
+    def run(self, prompt, max_tokens, tool=None, tool_inventory=None):
+        self.prompts.append(prompt)
+        return BackendResult(
+            output=self.text,
+            tokens_used=len(self.text) // 4 + 1,
+            success=True,
+            entropy=0.0,
+        )
+
+
+def test_marker_classifier_is_default():
+    v = Verifier(backend=StubBackend())
+    assert isinstance(v.coherence_classifier, MarkerCoherenceClassifier)
+
+
+def test_custom_coherence_classifier_is_consulted():
+    class _AlwaysFlags:
+        def classify(self, output):
+            return 0.9, ["fake contradiction"]
+
+    cfg = VerifierConfig(coherence_classifier=_AlwaysFlags())
+    v = Verifier(backend=StubBackend(), config=cfg)
+    trace = _trace_with_output("the sky is blue")
+    result = v.verify(Task(input="x"), trace, gate_open=True)
+    assert result.coherence_severity == pytest.approx(0.9)
+    assert result.contradictions == ["fake contradiction"]
+
+
+def test_llm_coherence_classifier_parses_yes_verdict():
+    backend = _ScriptedBackend(
+        "VERDICT: YES\nSEVERITY: 0.8\n"
+        "CONTRADICTIONS: claim A contradicts claim B; foo contradicts bar\n"
+    )
+    clf = LLMCoherenceClassifier(backend=backend)
+    severity, contradictions = clf.classify("any text")
+    assert severity == pytest.approx(0.8)
+    assert contradictions == [
+        "claim A contradicts claim B",
+        "foo contradicts bar",
+    ]
+    # The classifier actually called the backend with the text embedded.
+    assert "any text" in backend.prompts[0]
+
+
+def test_llm_coherence_classifier_no_verdict_returns_zero():
+    backend = _ScriptedBackend(
+        "VERDICT: NO\nSEVERITY: 0.3\nCONTRADICTIONS: NONE\n"
+    )
+    clf = LLMCoherenceClassifier(backend=backend)
+    severity, contradictions = clf.classify("any text")
+    assert severity == 0.0
+    assert contradictions == []
+
+
+def test_llm_coherence_classifier_yes_without_severity_gets_floor():
+    severity, _ = _parse_coherence_response(
+        "VERDICT: YES\nCONTRADICTIONS: one thing; another thing\n"
+    )
+    assert severity >= 0.5
+
+
+def test_llm_coherence_classifier_empty_text_short_circuits():
+    backend = _ScriptedBackend("VERDICT: YES\nSEVERITY: 1.0\n")
+    clf = LLMCoherenceClassifier(backend=backend)
+    assert clf.classify("") == (0.0, [])
+    assert backend.prompts == []  # Never called on empty input.
+
+
+def test_llm_coherence_classifier_tolerates_backend_errors():
+    class _Boom:
+        def run(self, *a, **kw):
+            raise RuntimeError("api down")
+
+    clf = LLMCoherenceClassifier(backend=_Boom())
+    severity, contradictions = clf.classify("anything")
+    assert severity == 0.0
+    assert contradictions == []
+
+
+def test_verifier_uses_llm_classifier_end_to_end():
+    backend = _ScriptedBackend(
+        "VERDICT: YES\nSEVERITY: 0.7\nCONTRADICTIONS: A; B\n"
+    )
+    cfg = VerifierConfig(
+        coherence_classifier=LLMCoherenceClassifier(backend=backend),
+    )
+    v = Verifier(backend=StubBackend(), config=cfg)
+    trace = _trace_with_output("Some text claiming two incompatible things.")
+    result = v.verify(Task(input="x"), trace, gate_open=True)
+    assert result.coherence_severity == pytest.approx(0.7)
+    assert result.contradictions == ["A", "B"]
+    # Verifier's own backend (StubBackend) and the classifier's backend
+    # are physically distinct — preserves the §1.3 "separate inference
+    # path" guarantee even for the coherence sub-check.
+    assert v.backend is not backend

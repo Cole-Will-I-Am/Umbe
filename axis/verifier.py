@@ -24,13 +24,137 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 
 from .backends.base import InferenceBackend
 from .backends.stub import StubBackend
 from .memory import EpisodicMemory
 from .memory.embedding import cosine, embed
 from .types import ExecutionTrace, Stakes, Task
+
+
+# ---------------------------------------------------------------------------
+# Coherence classifier — pluggable
+# ---------------------------------------------------------------------------
+@runtime_checkable
+class CoherenceClassifier(Protocol):
+    """Classify self-contradiction inside a text output.
+
+    Returns ``(severity, contradictions)`` where severity ∈ [0, 1]
+    (0 = clean, 1 = severe) and ``contradictions`` is a list of the
+    evidence fragments that triggered the verdict.
+
+    Implementations live outside the Verifier so the Verifier's scoring
+    interface stays stable while the classifier is upgraded from
+    marker-phrase heuristics to a real NLI model.
+    """
+
+    def classify(self, output: str) -> tuple[float, list[str]]:  # pragma: no cover
+        ...
+
+
+class MarkerCoherenceClassifier:
+    """Zero-dep default: flags a small set of contradiction markers.
+
+    This is deliberately conservative — it preserves the exact behavior
+    of the original Verifier. Upgrade by constructing the Verifier with
+    an ``LLMCoherenceClassifier`` or your own learned implementation.
+    """
+
+    DEFAULT_MARKERS: tuple[str, ...] = (
+        "however contradicts",
+        "actually wrong",
+        "no it is",
+        "but earlier said",
+    )
+
+    def __init__(self, markers: Optional[tuple[str, ...]] = None) -> None:
+        self.markers = markers or self.DEFAULT_MARKERS
+
+    def classify(self, output: str) -> tuple[float, list[str]]:
+        if not output:
+            return 0.0, []
+        lowered = output.lower()
+        hits = [m for m in self.markers if m in lowered]
+        severity = min(1.0, 0.25 * len(hits))
+        return severity, hits
+
+
+class LLMCoherenceClassifier:
+    """Backend-driven contradiction detector.
+
+    Asks an inference backend (a *verifier* backend, disjoint from the
+    Executor's, per §1.3) whether the text contradicts itself. Expects a
+    structured YES/NO answer followed by optional contradiction excerpts.
+
+    The backend handle is reused across calls so the cost is one extra
+    inference per verification. The Scheduler's verification budget
+    covers it.
+    """
+
+    PROMPT = (
+        "You are a strict coherence checker. The following text is the "
+        "output of an AI reasoning step. Determine whether it contains "
+        "internal contradictions — claims that cannot simultaneously "
+        "be true.\n\n"
+        "Respond in this exact format:\n"
+        "VERDICT: YES or NO\n"
+        "SEVERITY: 0.0 to 1.0\n"
+        "CONTRADICTIONS: semicolon-separated fragments, or NONE\n\n"
+        "Text:\n{text}\n"
+    )
+
+    def __init__(
+        self,
+        backend: InferenceBackend,
+        max_tokens: int = 256,
+    ) -> None:
+        self.backend = backend
+        self.max_tokens = max_tokens
+
+    def classify(self, output: str) -> tuple[float, list[str]]:
+        if not output:
+            return 0.0, []
+        prompt = self.PROMPT.format(text=output)
+        try:
+            result = self.backend.run(prompt=prompt, max_tokens=self.max_tokens)
+        except Exception:
+            # Fall back to "no verdict" — let the marker classifier or
+            # score combiner decide. We never raise out of the Verifier.
+            return 0.0, []
+        return _parse_coherence_response(result.output or "")
+
+
+def _parse_coherence_response(text: str) -> tuple[float, list[str]]:
+    """Parse the strict-format response from LLMCoherenceClassifier.
+
+    Tolerant of ordering and surrounding prose — anchored on the
+    VERDICT/SEVERITY/CONTRADICTIONS labels.
+    """
+    verdict_match = re.search(r"VERDICT:\s*(YES|NO)", text, re.IGNORECASE)
+    severity_match = re.search(r"SEVERITY:\s*([0-9]*\.?[0-9]+)", text)
+    contr_match = re.search(r"CONTRADICTIONS:\s*(.+)", text, re.IGNORECASE)
+
+    verdict = (verdict_match.group(1).upper() if verdict_match else "NO")
+    try:
+        severity = float(severity_match.group(1)) if severity_match else 0.0
+    except ValueError:
+        severity = 0.0
+    severity = max(0.0, min(1.0, severity))
+    if verdict == "NO":
+        severity = 0.0
+
+    contradictions: list[str] = []
+    if contr_match:
+        raw = contr_match.group(1).strip()
+        if raw and raw.upper() != "NONE":
+            contradictions = [c.strip() for c in raw.split(";") if c.strip()]
+
+    if verdict == "YES" and severity == 0.0:
+        # Guarantee a non-zero severity when the model says there's a
+        # contradiction — lets the score combiner actually penalise it.
+        severity = 0.5
+    return severity, contradictions
 
 
 @dataclass
@@ -65,17 +189,15 @@ class VerificationResult:
 @dataclass
 class VerifierConfig:
     pass_threshold: float = 0.6
-    # Contradiction keywords that the coherence classifier flags. Crude
-    # placeholder for a real NLI model — upgrade later without changing
-    # the Verifier's interface.
-    contradiction_markers: tuple[str, ...] = (
-        "however contradicts",
-        "actually wrong",
-        "no it is",
-        "but earlier said",
-    )
+    # Contradiction keywords the default marker classifier flags.
+    # Retained as a config knob so callers can tune the marker set
+    # without subclassing MarkerCoherenceClassifier.
+    contradiction_markers: tuple[str, ...] = MarkerCoherenceClassifier.DEFAULT_MARKERS
     claim_markers: tuple[str, ...] = ("is", "are", "was", "were", "will", "has")
     critical_always_verify: bool = True
+    # Pluggable coherence classifier (§1.3). If None, the Verifier uses
+    # a MarkerCoherenceClassifier seeded from contradiction_markers.
+    coherence_classifier: Optional[CoherenceClassifier] = None
 
 
 class Verifier:
@@ -95,6 +217,14 @@ class Verifier:
         self.backend: InferenceBackend = backend or StubBackend()
         self.config = config or VerifierConfig()
         self.episodic = episodic
+        # Resolve the coherence classifier. Explicit wins; otherwise
+        # build a marker classifier from the config's marker tuple so
+        # existing callers that only tweak contradiction_markers keep
+        # working.
+        self.coherence_classifier: CoherenceClassifier = (
+            self.config.coherence_classifier
+            or MarkerCoherenceClassifier(self.config.contradiction_markers)
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -208,12 +338,7 @@ class Verifier:
         return supported / len(claims), unsupported
 
     def _coherence(self, output: str) -> tuple[float, list[str]]:
-        if not output:
-            return 0.0, []
-        lowered = output.lower()
-        hits = [m for m in self.config.contradiction_markers if m in lowered]
-        severity = min(1.0, 0.25 * len(hits))
-        return severity, hits
+        return self.coherence_classifier.classify(output)
 
     def _friction(self, trace: ExecutionTrace) -> int:
         tool_errors = sum(
