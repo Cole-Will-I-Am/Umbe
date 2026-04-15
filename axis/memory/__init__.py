@@ -12,6 +12,15 @@ The MemoryManager class is the single entry point that owns these stores
 and enforces the §6 State Access Matrix rules (who can write what).
 """
 
+from .embedding import (
+    EmbeddingProvider,
+    HashedBagOfWordsProvider,
+    SentenceTransformerProvider,
+    cosine,
+    embed,
+    get_default_provider,
+    set_default_provider,
+)
 from .episodic import Episode, EpisodicMemory
 from .forgetting import ForgettingEngine
 from .manager import MemoryManager
@@ -19,12 +28,19 @@ from .procedural import Procedure, ProceduralMemory
 from .semantic import SemanticEntity, SemanticMemory
 
 __all__ = [
+    "EmbeddingProvider",
     "Episode",
     "EpisodicMemory",
     "ForgettingEngine",
+    "HashedBagOfWordsProvider",
     "MemoryManager",
     "Procedure",
     "ProceduralMemory",
     "SemanticEntity",
     "SemanticMemory",
+    "SentenceTransformerProvider",
+    "cosine",
+    "embed",
+    "get_default_provider",
+    "set_default_provider",
 ]
