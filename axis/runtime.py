@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Optional
 
 from .executor import Executor, WorkingMemory
+from .memory import MemoryManager
 from .planner import Planner
 from .scheduler import Scheduler
 from .telemetry import TelemetryObserver
@@ -33,6 +34,7 @@ class AxisRuntime:
         planner: Optional[Planner] = None,
         executor: Optional[Executor] = None,
         observer: Optional[TelemetryObserver] = None,
+        memory: Optional[MemoryManager] = None,
         max_replans: int = 2,
         auto_refresh_self_model: bool = True,
     ) -> None:
@@ -40,6 +42,7 @@ class AxisRuntime:
         self.planner = planner or Planner()
         self.executor = executor or Executor()
         self.observer = observer
+        self.memory = memory
         self.max_replans = max_replans
         self.auto_refresh_self_model = auto_refresh_self_model
 
@@ -101,6 +104,12 @@ class AxisRuntime:
                 and self.observer.should_refresh_self_model()
             ):
                 self._refresh_self_model()
+
+        if self.memory is not None:
+            self.memory.record_episode(trace, task)
+            # Keep the Planner's procedural-memory view in sync with the
+            # MemoryManager's validated procedures.
+            self.planner.procedural_memory = self.memory.procedural_index_for_planner()
 
         return trace
 

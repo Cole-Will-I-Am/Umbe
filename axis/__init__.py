@@ -23,6 +23,16 @@ from .types import (
 from .scheduler import Scheduler, SchedulerConfig
 from .planner import Planner
 from .executor import Executor, WorkingMemory
+from .memory import (
+    Episode,
+    EpisodicMemory,
+    ForgettingEngine,
+    MemoryManager,
+    Procedure,
+    ProceduralMemory,
+    SemanticEntity,
+    SemanticMemory,
+)
 from .telemetry import StructuredSink, TelemetryObserver, TelemetryRecord
 from .runtime import AxisRuntime
 
@@ -45,5 +55,13 @@ __all__ = [
     "TelemetryObserver",
     "TelemetryRecord",
     "StructuredSink",
+    "MemoryManager",
+    "EpisodicMemory",
+    "Episode",
+    "SemanticMemory",
+    "SemanticEntity",
+    "ProceduralMemory",
+    "Procedure",
+    "ForgettingEngine",
     "AxisRuntime",
 ]
