@@ -33,7 +33,16 @@ from .memory import (
     SemanticEntity,
     SemanticMemory,
 )
+from .adaptation import (
+    AdaptationConfig,
+    AdaptationManager,
+    ChangeClass,
+    Deployment,
+    Proposal,
+)
+from .eval_harness import EvalCase, EvalHarness, EvalReport
 from .policy_router import PolicyRouter, RoutingDecision
+from .safety import InvariantViolation, SafetyMonitor
 from .telemetry import StructuredSink, TelemetryObserver, TelemetryRecord
 from .verifier import VerificationResult, Verifier, VerifierConfig
 from .runtime import AxisRuntime
@@ -70,5 +79,15 @@ __all__ = [
     "VerificationResult",
     "PolicyRouter",
     "RoutingDecision",
+    "AdaptationManager",
+    "AdaptationConfig",
+    "ChangeClass",
+    "Deployment",
+    "Proposal",
+    "EvalCase",
+    "EvalHarness",
+    "EvalReport",
+    "SafetyMonitor",
+    "InvariantViolation",
     "AxisRuntime",
 ]
