@@ -14,6 +14,10 @@ class BackendResult:
     trajectory disagreement). The stub backend returns a fixed value; a
     real backend should return a calibrated estimate for the Verifier
     (Priority 4) to consume.
+
+    `cache_read_tokens` / `cache_creation_tokens` report prompt caching
+    usage when the backend supports it. Both default to 0 for backends
+    that don't cache.
     """
 
     output: str
@@ -22,6 +26,8 @@ class BackendResult:
     error: Optional[str] = None
     entropy: float = 0.0
     tool_calls: list[dict] = field(default_factory=list)
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
 
 @runtime_checkable
